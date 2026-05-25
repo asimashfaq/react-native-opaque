@@ -8,7 +8,7 @@ use opaque_ke::{
     ClientLogin, ClientLoginFinishParameters, ClientRegistration,
     ClientRegistrationFinishParameters, CredentialFinalization, CredentialRequest,
     CredentialResponse, Identifiers, RegistrationRequest, RegistrationResponse, ServerLogin,
-    ServerLoginStartParameters, ServerRegistration, ServerSetup,
+    ServerLoginParameters, ServerRegistration, ServerSetup,
 };
 
 struct DefaultCipherSuite;
@@ -16,16 +16,15 @@ struct DefaultCipherSuite;
 #[cfg(not(feature = "p256"))]
 impl CipherSuite for DefaultCipherSuite {
     type OprfCs = opaque_ke::Ristretto255;
-    type KeGroup = opaque_ke::Ristretto255;
-    type KeyExchange = opaque_ke::key_exchange::tripledh::TripleDh;
+    type KeyExchange =
+        opaque_ke::key_exchange::tripledh::TripleDh<opaque_ke::Ristretto255, sha2::Sha512>;
     type Ksf = Argon2<'static>;
 }
 
 #[cfg(feature = "p256")]
 impl CipherSuite for DefaultCipherSuite {
     type OprfCs = p256::NistP256;
-    type KeGroup = p256::NistP256;
-    type KeyExchange = opaque_ke::key_exchange::tripledh::TripleDh;
+    type KeyExchange = opaque_ke::key_exchange::tripledh::TripleDh<p256::NistP256, sha2::Sha256>;
     type Ksf = Argon2<'static>;
 }
 
@@ -258,7 +257,7 @@ fn opaque_start_server_login(
     let server_ident = get_optional_string(params.server_identifier)?;
     let client_ident = get_optional_string(params.client_identifier)?;
 
-    let start_params = ServerLoginStartParameters {
+    let start_params = ServerLoginParameters {
         identifiers: Identifiers {
             client: client_ident.as_ref().map(|val| val.as_bytes()),
             server: server_ident.as_ref().map(|val| val.as_bytes()),
@@ -295,10 +294,18 @@ fn opaque_finish_server_login(
     let state_bytes = base64_decode("serverLoginState", params.server_login_state)?;
     let state = ServerLogin::<DefaultCipherSuite>::deserialize(&state_bytes)
         .map_err(from_protocol_error("deserialize serverLoginState"))?;
+    let finish_params = ServerLoginParameters {
+        identifiers: Identifiers {
+            client: None,
+            server: None,
+        },
+        context: None,
+    };
     let server_login_finish_result = state
         .finish(
             CredentialFinalization::deserialize(&credential_finalization_bytes)
                 .map_err(from_protocol_error("deserialize finishLoginRequest"))?,
+            finish_params,
         )
         .map_err(from_protocol_error("finish server login"))?;
     Ok(OpaqueFinishServerLoginResult {
@@ -429,7 +436,9 @@ fn opaque_finish_client_login(
         None,
     );
 
+    let mut rng = OsRng;
     let result = state.finish(
+        &mut rng,
         params.password.as_bytes(),
         CredentialResponse::deserialize(&credential_response_bytes)
             .map_err(from_protocol_error("deserialize loginResponse"))?,

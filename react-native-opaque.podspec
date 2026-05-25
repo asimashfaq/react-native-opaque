@@ -38,8 +38,10 @@ Pod::Spec.new do |s|
         "CLANG_CXX_LANGUAGE_STANDARD" => "c++17",
         **rustlib_xcconfig
     }
-    s.dependency "React-Codegen"
-    s.dependency "RCT-Folly"
+    # RN 0.85+ renamed `React-Codegen` -> `ReactCodegen` and stopped
+    # vending `RCT-Folly` as a standalone pod (Folly is bundled into the
+    # prebuilt `ReactNativeDependencies` framework).
+    s.dependency "ReactCodegen"
     s.dependency "RCTRequired"
     s.dependency "RCTTypeSafety"
     s.dependency "ReactCommon/turbomodule/core"
