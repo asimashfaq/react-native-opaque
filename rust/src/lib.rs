@@ -1,7 +1,10 @@
 use std::fmt;
 
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
 use base64::{engine::general_purpose as b64, Engine as _};
+use opaque_ke::errors::InternalError;
+use opaque_ke::generic_array::{ArrayLength, GenericArray};
+use opaque_ke::ksf::Ksf;
 use opaque_ke::rand::rngs::OsRng;
 use opaque_ke::{ciphersuite::CipherSuite, errors::ProtocolError};
 use opaque_ke::{
@@ -11,6 +14,59 @@ use opaque_ke::{
     ServerLoginParameters, ServerRegistration, ServerSetup,
 };
 
+// Wire-compat with @serenity-kit/opaque 1.1.0 (which is what the
+// dex-v2 web client uses). Serenity's WASM client defaults the
+// KeyStretchingFunctionConfig to `MemoryConstrained` → Argon2id with
+// (t=3, m=2^16 KiB = 64 MiB, p=4) and a 16-byte all-zero salt.
+//
+// opaque-ke 4.0.0's built-in `impl Ksf for Argon2<'_>` uses
+// `Argon2::default()` instead — (t=2, m=19456 KiB, p=1) — so a mobile
+// client that registers/logins via the unwrapped `Argon2<'static>`
+// produces an envelope/AKE that web cannot decrypt and vice-versa. The
+// backend never sees the mismatch (KSF is purely client-side), so the
+// symptom is `client.finishLogin → null → "wrong password"` after a
+// cross-client register/login. See ~/.claude/projects/
+// -Users-asimashfaq-0x-mobile-app/memory/project_opaque_version_pin.md
+// for the matching memory entry.
+//
+// Tradeoff: bumping mobile to 64 MiB Argon2 means existing
+// mobile-registered xpass envelopes become unreadable. That is the
+// agreed cutover — see commit message + release notes.
+const KSF_M_COST_KIB: u32 = 1 << 16; // 65 536 KiB = 64 MiB
+const KSF_T_COST: u32 = 3;
+const KSF_P_COST: u32 = 4;
+
+struct MemoryConstrainedKsf {
+    argon: Argon2<'static>,
+}
+
+impl Default for MemoryConstrainedKsf {
+    fn default() -> Self {
+        let mut pb = ParamsBuilder::default();
+        pb.t_cost(KSF_T_COST);
+        pb.m_cost(KSF_M_COST_KIB);
+        pb.p_cost(KSF_P_COST);
+        let params = pb
+            .build()
+            .expect("memory-constrained argon2 params are valid");
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        Self { argon }
+    }
+}
+
+impl Ksf for MemoryConstrainedKsf {
+    fn hash<L: ArrayLength<u8>>(
+        &self,
+        input: GenericArray<u8, L>,
+    ) -> Result<GenericArray<u8, L>, InternalError> {
+        let mut output = GenericArray::default();
+        self.argon
+            .hash_password_into(&input, &[0; argon2::RECOMMENDED_SALT_LEN], &mut output)
+            .map_err(|_| InternalError::KsfError)?;
+        Ok(output)
+    }
+}
+
 struct DefaultCipherSuite;
 
 #[cfg(not(feature = "p256"))]
@@ -18,14 +74,14 @@ impl CipherSuite for DefaultCipherSuite {
     type OprfCs = opaque_ke::Ristretto255;
     type KeyExchange =
         opaque_ke::key_exchange::tripledh::TripleDh<opaque_ke::Ristretto255, sha2::Sha512>;
-    type Ksf = Argon2<'static>;
+    type Ksf = MemoryConstrainedKsf;
 }
 
 #[cfg(feature = "p256")]
 impl CipherSuite for DefaultCipherSuite {
     type OprfCs = p256::NistP256;
     type KeyExchange = opaque_ke::key_exchange::tripledh::TripleDh<p256::NistP256, sha2::Sha256>;
-    type Ksf = Argon2<'static>;
+    type Ksf = MemoryConstrainedKsf;
 }
 
 enum Error {
